@@ -1,0 +1,541 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+R Bloggers code: https://blog.ephorie.de/epidemiology-how-contagious-is-novel-coronavirus-2019-ncov
+
+Limitations of original analysis to fix:
+#Ignoring relatively low infection rates and/or severity in children, which is around ~15% 12 or under (17% are 14 or younger)
+#Ignoring localization of infection within Wuhan provice especially; smaller sub-population with delayed/likely spread to other parts of China.
+#Ignoring intervention effectiveness - clearly there has been some slowing in recent days, as would be expected given the extent of the lockdown.
+#This ignores international spread potential - this could be recreated with cross-spreading in different locales, along with relative effectiveness of measures to prevent that spread.
+
+```{r Setup}
+library(tidyverse)
+#install.packages("googlesheets")
+#library(googlesheets)
+#install.packages('gsheet')
+library(gsheet)
+library(deSolve)
+library(stringr)
+
+#install.packages("leaflet")
+#install.packages("shiny")
+library(leaflet)
+library(shiny)
+#Get the latest Install
+#if(!requireNamespace("devtools")) install.packages("devtools")
+#devtools::install_github("dkahle/ggmap") #, ref = "tidyup", force=TRUE)
+#install.packages('ggmap')
+#Load the library
+library(ggmap)
+```
+
+
+
+```{r Download Public Data}
+
+#time series data I want: https://docs.google.com/spreadsheets/u/1/d/1UF2pSkFTURko2OvfHWWlFpDFAr1UxCBA4JLwlSP6KFo/htmlview?usp=sharing&sle=true#
+
+#This lags the data in the other google doc they provide, and lags the Website reports.  Not terribly maybe but a half day?
+
+#Download the time series data from google sheets using gsheet package.
+#inf_data <- gsheet2tbl('docs.google.com/spreadsheets/u/1/d/1UF2pSkFTURko2OvfHWWlFpDFAr1UxCBA4JLwlSP6KFo', sheetid = "Confirmed")
+#rec_data <- gsheet2tbl('docs.google.com/spreadsheets/u/1/d/1UF2pSkFTURko2OvfHWWlFpDFAr1UxCBA4JLwlSP6KFo', sheetid = 2)
+
+inf_data <- read.csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_19-covid-Confirmed.csv", 
+                     stringsAsFactors = FALSE)
+rec_data <- read.csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_19-covid-Recovered.csv", 
+                     stringsAsFactors = FALSE)
+deaths_data <- read.csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_19-covid-Deaths.csv", 
+                        stringsAsFactors = FALSE)
+
+
+
+#Now tidy the data.
+inf_data_tidy <- inf_data %>% 
+  pivot_longer(-(1:4), names_to = "date_time", values_to = "infections") %>%
+  mutate(date = str_sub(date_time, start = 2),
+         month = (str_split(date, pattern = "\\.", simplify = TRUE)[,1]),
+         day = (str_split(date, pattern = "\\.", simplify = TRUE)[,2]),
+         year = "2020", #(str_split(date, pattern = "\\.", simplify = TRUE)[,3]),
+         date = as.Date(paste(year,month,day,sep = "-")), #,tryFormats = c("%m/%d/%Y")),
+         infections = ifelse(is.na(infections),0,infections)) %>%
+  filter(!is.na(infections)) %>%
+  group_by(`Province.State`,`Country.Region`,Lat,Long,date) %>%
+  summarize(infections = max(infections)) %>%
+  mutate(is_agg = FALSE)
+
+rec_data_tidy <- rec_data %>% 
+  pivot_longer(-(1:4), names_to = "date_time", values_to = "recovered") %>%
+  mutate(date = str_sub(date_time, start = 2),
+         month = (str_split(date, pattern = "\\.", simplify = TRUE)[,1]),
+         day = (str_split(date, pattern = "\\.", simplify = TRUE)[,2]),
+         year = "2020", #(str_split(date, pattern = "\\.", simplify = TRUE)[,3]),
+         date = as.Date(paste(year,month,day,sep = "-")), #,tryFormats = c("%m/%d/%Y")),
+         recovered = ifelse(is.na(recovered),0,recovered)) %>%
+  filter(!is.na(recovered)) %>%
+  group_by(`Province.State`,`Country.Region`,Lat,Long,date) %>%
+  summarize(recovered = max(recovered)) %>%
+  mutate(is_agg = FALSE)
+
+deaths_data_tidy <- deaths_data %>% 
+  pivot_longer(-(1:4), names_to = "date_time", values_to = "deaths") %>%
+  mutate(date = str_sub(date_time, start = 2),
+         month = (str_split(date, pattern = "\\.", simplify = TRUE)[,1]),
+         day = (str_split(date, pattern = "\\.", simplify = TRUE)[,2]),
+         year = "2020", #(str_split(date, pattern = "\\.", simplify = TRUE)[,3]),
+         date = as.Date(paste(year,month,day,sep = "-")), #,tryFormats = c("%m/%d/%Y")),
+         deaths = ifelse(is.na(deaths),0,deaths)) %>%
+  filter(!is.na(deaths)) %>%
+  group_by(`Province.State`,`Country.Region`,Lat,Long,date) %>%
+  summarize(deaths = max(deaths)) %>%
+  mutate(is_agg = FALSE)
+
+inf_rec_death_data_tidy <- 
+  left_join(inf_data_tidy,rec_data_tidy) %>% 
+  left_join(.,deaths_data_tidy)
+
+
+#Add summary groups before filtering out duplicate values.
+inf_rec_death_data_tidy <- 
+  full_join(inf_rec_death_data_tidy,
+            inf_rec_death_data_tidy %>% 
+              filter(`Country.Region` == "Mainland China",
+                                     `Province.State` != "Hubei") %>%
+              group_by(`Country.Region`, date) %>%
+              summarize(infections = sum(infections, na.rm=TRUE),
+                        recovered = sum(recovered, na.rm=TRUE),
+                        deaths = sum(deaths, na.rm=TRUE)) %>%
+              mutate(`Province.State` = "Mainland China Not Hubei",
+                     is_agg = TRUE)
+            )
+
+inf_rec_death_data_tidy <- 
+  full_join(inf_rec_death_data_tidy,
+            inf_rec_death_data_tidy %>% 
+              filter(`Country.Region` == "Mainland China",
+                     is_agg == FALSE) %>%
+              group_by(`Country.Region`, date) %>%
+              summarize(infections = sum(infections, na.rm=TRUE),
+                        recovered = sum(recovered, na.rm=TRUE),
+                        deaths = sum(deaths, na.rm=TRUE)) %>%
+              mutate(`Province.State` = "Mainland China",
+                     is_agg = TRUE)
+            )
+
+inf_rec_death_data_tidy <- inf_rec_death_data_tidy %>% 
+  group_by(`Province.State`,`Country.Region`) %>%
+  mutate(new_infections = infections - lag(infections),
+         new_infections = ifelse(is.na(new_infections),0, new_infections))
+
+inf_rec_death_data_tidy <- inf_rec_death_data_tidy %>% 
+  mutate(phase = case_when(
+               date < as.Date("2020-01-28") ~ "phase 1",
+               date >= as.Date("2020-01-28") & date < as.Date("2020-02-03") ~ "phase 2",
+               date >= as.Date("2020-02-03") ~ "phase 3"
+               ))
+
+```
+
+
+Goal with this code is to isolate "community spread" cases and model likely undetected growth in cases based on assumptions about spread patterns, detection delays, etc.
+```{r Estimate Underlying Cases}
+
+View(inf_data %>% filter(`Country.Region` == "US") %>% select(1:10,20:53))
+
+#First need to identify presumed "community spread" cases in data, since this isn't currently available in our data stream.
+
+inf_rec_death_data_tidy_us <- inf_rec_death_data_tidy %>%
+  filter(`Country.Region` == "US",
+         !(`Province.State` %in% state.name), #remove state aggregates; fix eventually
+         #date != as.Date("2020-03-10") #funny data uncleaned at most recent date; cut out manually.
+         ) %>%
+  mutate(comm_infections = 
+           ifelse(!grepl("Princess",`Province.State`, ignore.case=TRUE) &
+                  date >= as.Date("2020-02-27") & `Province.State`!="Providence, RI",
+                  new_infections,0),
+         comm_infections_total = cumsum(comm_infections))
+
+#View community cases
+inf_rec_death_data_tidy_us %>% filter(comm_infections_total > 0)  
+inf_rec_death_data_tidy_us %>% 
+  group_by(`Province.State`,`Country.Region`) %>% 
+  filter(date == as.Date("2020-03-10"),
+         !(`Province.State` %in% state.name)) %>% 
+  summarize(count = sum(infections)) %>% 
+ungroup() %>% summarize(count = sum(count))
+
+
+
+#Compare #aggregate states cases vs. # detailed states cases
+#887 aggregate; 783 detailed.
+#Eventually isolate discrepancies.
+#For now just deal with non-state results.
+
+
+#Generate case-level microdata which can then be used in a more sophisticated way to model
+
+tmp <- inf_rec_death_data_tidy_us %>% 
+  filter(new_infections > 0)
+  
+infected_db <- tibble()
+infected_db_row <- tibble()
+
+for (i in 1:nrow(inf_rec_death_data_tidy_us)) {
+  rep <- inf_rec_death_data_tidy_us$new_infections[i]
+  while (rep > 0) {
+    infected_db_row <- select(inf_rec_death_data_tidy_us[i,], 1:5)
+    rep <- rep - 1
+    infected_db <- bind_rows(infected_db, infected_db_row)
+  }
+}
+
+#Add in recently reported international and domestic travel cases from news and elsewhere 
+infected_db <- infected_db %>%
+  mutate(state = (str_split(`Province.State`,", ", simplify = TRUE))[,2],
+         state = (str_split(state," ", simplify = TRUE))[,1],
+         locality = (str_split(`Province.State`,", ", simplify = TRUE))[,1],
+         #locality = (str_split(locality," ", simplify = TRUE))[,1]
+         ) %>%
+  arrange(date,state) %>%
+  mutate(id = paste("case", 1:nrow(infected_db), sep = ""),
+         origin = case_when(
+           grepl("Diamond",`Province.State`, ignore.case=TRUE) ~ "Diamond Princess",
+           date <= as.Date("2020-02-26") ~ "International travel",
+           grepl("Princess",`Province.State`, ignore.case=TRUE) ~ "Grand Princess",
+           date == as.Date("2020-03-01") & state == "RI" ~ "International travel",
+           0 == 1 ~ "Domestic travel",
+           1 == 1 ~ "Community"))
+           
+infected_db_contig_us <- infected_db %>% 
+  filter(Long < -60, 
+         Long > -130,
+         Lat < 50,
+         Lat > 20)
+
+write.csv(infected_db_contig_us,"coronavirus_cases_flat.csv")
+
+#play with mapping the microdata (ggmaps?)
+
+#Google static map service API key: 
+
+#More Q&A - https://github.com/dkahle/ggmap/issues/51
+
+#Set your API Key
+register_google(key = "")
+
+#Center at Iowa?  lon = -91.5984, lat = 41.6699
+#Colorado? lat = -104.9903, lon = 39.7392
+
+#get infecteds for only contiguous US:
+
+
+p <- ggmap(get_googlemap(center = c(lat = -97, lon = 39.7392),
+                    zoom = 4, scale = 2,
+                    maptype ='terrain',
+                    color = 'color')) 
+p + 
+geom_point(aes(x = jitter(Long, amount = .2), y = jitter(Lat, amount = .2),  colour = origin), 
+           data = infected_db_contig_us, size = 1, alpha = .7) + 
+  theme(legend.position="bottom") + 
+geom_bin2d(
+  aes(x = jitter(Long, amount = .5), y = jitter(Lat, amount = .5), alpha = .25), bins = 100, size = 10,
+    data = infected_db_contig_us)    
+
+#Figure out how to change the color schemes in the below (more red...)
+p + geom_bin2d(
+  aes(x = jitter(Long, amount = .5), y = jitter(Lat, amount = .5), alpha = .25), bins = 100, size = 10,
+    data = infected_db_contig_us)    
+
+p + stat_density_2d(
+    aes(x = jitter(Long, amount = .0), y = jitter(Lat, amount = .0), fill = ..level.., alpha = .25), 
+    data = infected_db_contig_us, 
+    size = .01,
+    bins = 5,
+    geom = "polygon")
+
+
+```
+
+
+```{r ggplot Inf Data}
+
+inf_rec_death_data_tidy %>% 
+  ggplot(aes(x=date, y=infections, colour = `Province.State`)) + 
+  geom_point() + 
+  scale_y_log10() + 
+  geom_line()
+
+inf_rec_death_data_tidy %>% 
+  filter(is_agg == FALSE) %>%
+  group_by(`Country.Region`, date) %>%
+  summarize(infections = sum(infections, na.rm = TRUE)) %>%
+  ggplot(aes(x=date, y=infections, colour = `Country.Region`)) + 
+  geom_point() + 
+  scale_y_log10() + 
+  geom_line()
+
+inf_rec_death_data_tidy %>% 
+  filter(is_agg == FALSE,
+         `Country.Region` == "US") %>%
+  #group_by(`Country.Region`, `Province.State`, date) %>%
+  #summarize(infections = sum(infections, na.rm = TRUE)) %>%
+  ggplot(aes(x=date, y=new_infections)) + 
+  geom_point() + 
+  scale_y_log10() + 
+  geom_line() +
+  facet_wrap(~`Province.State`)
+
+
+inf_rec_death_data_tidy %>% 
+  filter(`Province.State` %in% c("Hubei", "Mainland China Not Hubei")) %>%
+  ggplot(aes(x=date, y=infections, colour = `Province.State`, fill = phase)) + 
+  geom_point() + 
+  geom_line() + 
+  scale_y_log10() + 
+  geom_smooth(method = "lm", se = FALSE)
+#Looking at Hubei and non-Hubei data, we see a change around Jan 28th in terms of growth rates both national and local, but nothing obvious more recent.  
+
+inf_rec_death_data_tidy %>%
+  filter(is_agg == TRUE,
+         `Country.Region` == "Mainland China",
+         `Province.State` == "Mainland China") %>%
+  ggplot(aes(x=date, y=infections, colour = `Country.Region`, fill = phase)) + 
+  geom_point() + 
+  geom_line() + 
+  scale_y_log10() + 
+  geom_smooth(method = "lm", se = FALSE)
+
+
+inf_rec_death_data_tidy %>% 
+  filter(`Country.Region` == "Mainland China",
+         is_agg == FALSE) %>% 
+  group_by(`Country.Region`, `Province.State`, date) %>%
+  summarize(infections = sum(infections, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(`Province.State`,`Country.Region`) %>%
+  mutate(change = infections - lag(infections),
+         changepct = ifelse(infections == 0, 0, change / infections)) %>% 
+  ggplot(aes(x=date, y=changepct, colour = `Province.State`)) + 
+  geom_point() + 
+  geom_smooth(se=FALSE)
+
+
+
+```
+
+
+
+```{r SIR model function Original}
+
+run_SIR <- function(N, Infected, startdate, timeframe = 70, mortality_rate = 0.02, grouping = "")
+{
+
+Day <- 1:(length(Infected))  
+  
+#Fit a simple SIR model; "recovered" includes deaths!
+#Not sure how to read the following code!
+SIR <- function(time, state, parameters) {
+  par <- as.list(c(state, parameters))
+  with(par, {
+    dS <- -beta/N * I * S
+    dI <- beta/N * I * S - gamma * I
+    dR <- gamma * I
+    list(c(dS, dI, dR))
+    })
+}
+
+#Solve the system of ODEs, and project forward.
+init <- c(S = N-Infected[1], I = Infected[1], R = 0)
+RSS <- function(parameters) {
+  names(parameters) <- c("beta", "gamma")
+  out <- ode(y = init, times = Day, func = SIR, parms = parameters)
+  fit <- out[ , 3]
+  sum((Infected - fit)^2)
+}
+ 
+Opt <- optim(c(0.5, 0.5), RSS, method = "L-BFGS-B", lower = c(0, 0), upper = c(1, 1)) # optimize with some sensible conditions
+Opt$message
+## [1] "CONVERGENCE: REL_REDUCTION_OF_F <= FACTR*EPSMCH"
+ 
+Opt_par <- setNames(Opt$par, c("beta", "gamma"))
+Opt_par
+##      beta     gamma 
+## 0.6746089 0.3253912
+ 
+t <- 1:timeframe # time in days
+fit <- data.frame(ode(y = init, times = t, func = SIR, parms = Opt_par))
+col <- 1:3 # colour
+ 
+matplot(fit$time, fit[ , 2:4], type = "l", xlab = "Day", ylab = "Number of subjects", lwd = 2, lty = 1, col = col)
+matplot(fit$time, fit[ , 2:4], type = "l", xlab = "Day", ylab = "Number of subjects", lwd = 2, lty = 1, col = col, log = "y")
+## Warning in xy.coords(x, y, xlabel, ylabel, log = log): 1 y value <= 0
+## omitted from logarithmic plot
+ 
+points(Day, Infected)
+legend("bottomright", c("Susceptibles", "Infecteds", "Recovereds"), lty = 1, lwd = 2, col = col, inset = 0.05)
+title("SIR model 2019-nCoV China", outer = TRUE, line = -2)
+
+
+#Stats on Infectiveness (R0 = beta / gamma), Peak timing and # infected, and number of deaths given 2% mortality rate.
+par(old)
+R0 <- setNames(Opt_par["beta"] / Opt_par["gamma"], "R0")
+R0
+
+peakinfected <- fit[fit$I == max(fit$I), "I", drop = FALSE] # height of pandemic
+
+peakday <- fit[fit$I == max(fit$I), "time", drop = FALSE]
+
+# WAS: deaths <- max(fit$I) * mortality_rate # max deaths with supposed 2% mortality rate
+deaths <- max(fit$R) * mortality_rate
+    #Wierd they used max I (infected) to represent fraction exposed to death, but really it seems to be the recovered that include the dead. I am not sure how to reconcile their thinking - I need to understand how the model accounts for "recovery" - is this after a certain period of time or instantanteously (after infecting others); and how to match this to the quite different accounting of this done in the official stats!
+
+return(list(R0 = R0, fit = fit, deaths = deaths, peakday = peakday[1,1], peakinfected = peakinfected[1,1], totalinfected = max(fit$R), fractioninfected = max(fit$R) / N))
+}
+
+
+#Recent infection rates (observed since day 21) suggest R0 reduced to ~1.2; this low level can very substantially reduce the portion of the population ultimately infected. But much of this reduction is a result of massive measures that likely can't be sustained indefinitely!
+
+
+
+
+```
+
+
+```{r SIR model Fit to Inf and Rec}
+
+run_SIR_fit_inf_rec <- function(N, Recovered, Infected, startdate, timeframe = 70, mortality_rate = 0.02, grouping = "")
+{
+   
+    Day <- 1:(length(Recovered))  
+      
+    #Fit a simple SIR model; "recovered" includes deaths!
+    #Not sure how to read the following code!
+    SIR <- function(time, state, parameters) {
+      par <- as.list(c(state, parameters))
+      with(par, {
+        dS <- -beta/N * I * S
+        dI <- beta/N * I * S - gamma * I
+        dR <- gamma * I
+        list(c(dS, dI, dR))
+        })
+    }
+   
+    #Solve the system of ODEs, and project forward.
+    init <- c(S = N-(Infected[1] + Recovered[1]), I = Infected[1], R = Recovered[1])
+    RSS <- function(parameters) {
+      names(parameters) <- c("beta", "gamma")
+      out <- ode(y = init, times = Day, func = SIR, parms = parameters)
+      fit_rec <- out[ , 4]
+      fit_inf <- out[ , 3]
+      return(sum((Recovered - fit_rec)^2+5*(Infected - fit_inf)^2))
+    }
+    Opt <- optim(c(0.495, 0.495), RSS, method = "L-BFGS-B", lower = c(0, 0), upper = c(1, 1)) # optimize with some sensible conditions
+    Opt$message
+    ## [1] "CONVERGENCE: REL_REDUCTION_OF_F <= FACTR*EPSMCH"
+     
+    Opt_par <- setNames(Opt$par, c("beta", "gamma"))
+    Opt_par
+    ##      beta     gamma 
+    ## 0.6746089 0.3253912
+     
+    t <- 1:timeframe # time in days
+    fit <- data.frame(ode(y = init, times = t, func = SIR, parms = Opt_par))
+    col <- 1:3 # colour
+  
+
+    matplot(fit$time, fit[ , 2:4], type = "l", xlab = "Day", ylab = "Number of subjects", lwd = 2, lty = 1, col = col)
+    matplot(fit$time, fit[ , 2:4], type = "l", xlab = "Day", ylab = "Number of subjects", lwd = 2, lty = 1, col = col, log = "y")
+    ## Warning in xy.coords(x, y, xlabel, ylabel, log = log): 1 y value <= 0
+    ## omitted from logarithmic plot
+     
+    points(Day, Recovered, col = "blue")
+    points(Day, Infected, col = "red")
+    legend("bottomright", c("Susceptibles", "Infecteds", "Recovereds"), lty = 1, lwd = 2, col = col, inset = 0.05)
+    title(paste("SIR model 2019-nCoV",grouping, sep = "-"), outer = TRUE, line = -2)
+    
+  
+    #Stats on Infectiveness (R0 = beta / gamma), Peak timing and # infected, and number of deaths given 2% mortality rate.
+    par(old)
+    R0 <- setNames(Opt_par["beta"] / Opt_par["gamma"], "R0")
+    R0
+    beta <- setNames(Opt_par["beta"], "beta")
+    gamma <- setNames(Opt_par["gamma"], "gamma")
+    
+    peakinfected <- fit[fit$I == max(fit$I), "I", drop = FALSE] # height of pandemic
+    
+    peakday <- fit[fit$I == max(fit$I), "time", drop = FALSE]
+    
+    # WAS: deaths <- max(fit$I) * mortality_rate # max deaths with supposed 2% mortality rate
+    deaths <- max(fit$R) * mortality_rate
+        #Wierd they used max I (infected) to represent fraction exposed to death, but really it seems to be the recovered that include the dead. I am not sure how to reconcile their thinking - I need to understand how the model accounts for "recovery" - is this after a certain period of time or instantanteously (after infecting others); and how to match this to the quite different accounting of this done in the official stats!
+   
+    return(list(R0 = R0,
+                beta = beta,
+                gamma = gamma,
+                fit = fit, 
+                dailyinf = fit$S - lead(fit$S, 1),
+                deaths = deaths, 
+                peakday = peakday[1,1],
+                peakdate = startdate + peakday[1,1],
+                peakinfected = peakinfected[1,1], 
+                totalinfected = N - min(fit$S), 
+                fractioninfected = (N - min(fit$S)) / N)
+           )
+}
+
+```
+
+
+```{r US modeling}
+
+Pop_US <- 300000000
+pop_run <- Pop_US * pop_frac_susceptible
+country_region <- "US"
+province_state <- ""
+group_name <- "US"
+
+
+fit_start <- as.Date("2020-02-01") 
+fit_end <- as.Date("2020-03-10")
+
+
+
+
+
+
+result <- 
+  run_SIR_fit_inf_rec(
+          N = pop_run, 
+          Recovered = 
+            1 * (inf_rec_death_data_tidy %>%
+            filter(
+              `Country.Region` == country_region,
+              #`Province.State` == province_state,
+              date >= fit_start,
+              date <= fit_end))$recovered, 
+          Infected =
+            1 * (inf_rec_death_data_tidy %>%
+            filter(
+              `Country.Region` == country_region,
+              `Province.State` == province_state,
+              date >= fit_start,
+              date <= fit_end) %>%  #key date visually appears to be on or after 1/28?
+            mutate(current_infections = infections - (recovered + deaths)))$current_infections,
+          startdate = fit_start, 
+          timeframe = 25, 
+          mortality_rate = 0.02, 
+          grouping = group_name)
+
+
+```
+
+
+```{r Prep for Leaflet App}
+#understand data and commands
+data <- readRDS("CoronaVirusLeaflet/data/superzip.rds")
+
+```
+
